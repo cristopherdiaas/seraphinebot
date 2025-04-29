@@ -7,6 +7,13 @@ from collections import deque
 import random
 from dotenv import load_dotenv
 
+# Verificação inicial do PyNaCL
+try:
+    import nacl
+    print("PyNaCL está instalado corretamente!")
+except ImportError:
+    print("ERRO: PyNaCL não está instalado. Instale com: pip install pynacl")
+
 # Configurações
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -36,14 +43,13 @@ class MusicPlayer:
 
     def get_queue(self, guild_id):
         if guild_id not in self.queues:
-            self.queues[guild_id] = deque(maxlen=50)  # Limite de 50 músicas
+            self.queues[guild_id] = deque(maxlen=50)
         return self.queues[guild_id]
 
     async def play_next(self, ctx):
         queue = self.get_queue(ctx.guild.id)
         
         if self.loops.get(ctx.guild.id, False) and queue:
-            # Modo loop - toca a mesma música novamente
             await self.play_source(ctx, queue[0])
             return
 
@@ -87,21 +93,39 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 player = MusicPlayer()
 
+@bot.hybrid_command(name="join", description="Entra no canal de voz")
+async def join(ctx):
+    """Faz o bot entrar no seu canal de voz"""
+    try:
+        if not ctx.author.voice:
+            return await ctx.send("Você precisa estar em um canal de voz!")
+        
+        if ctx.voice_client:
+            if ctx.voice_client.channel == ctx.author.voice.channel:
+                return await ctx.send("Já estou no seu canal!")
+            await ctx.voice_client.move_to(ctx.author.voice.channel)
+        else:
+            await ctx.author.voice.channel.connect()
+        
+        await ctx.send(f"✅ Conectado ao canal {ctx.author.voice.channel.name}")
+    except Exception as e:
+        await ctx.send(f"❌ Erro ao conectar: {str(e)}")
+
 @bot.hybrid_command(name="play", description="Toca uma música ou adiciona à fila")
 async def play(ctx, *, query: str):
     """Toca música do YouTube (URL ou nome)"""
     await ctx.defer()
     
-    # Verificação de canal de voz
-    if not ctx.author.voice:
-        return await ctx.send("Entre em um canal de voz primeiro!")
-    
-    if not ctx.voice_client:
-        await ctx.author.voice.channel.connect()
-    elif ctx.voice_client.channel != ctx.author.voice.channel:
-        return await ctx.send("Estou em outro canal de voz!")
-
     try:
+        # Verificação de canal de voz
+        if not ctx.author.voice:
+            return await ctx.send("Entre em um canal de voz primeiro!")
+        
+        if not ctx.voice_client:
+            await join(ctx)
+        elif ctx.voice_client.channel != ctx.author.voice.channel:
+            return await ctx.send("Estou em outro canal de voz!")
+
         info = await player.get_info(query)
         if not info:
             return await ctx.send("Não encontrei essa música.")
@@ -114,11 +138,13 @@ async def play(ctx, *, query: str):
             queue.append(source)
             return await ctx.send(f"🎶 Adicionado à fila (#{len(queue)}): **{info['title']}**")
         
-        queue.append(source)  # Adiciona à fila mesmo que esteja vazia
+        queue.append(source)
         await player.play_next(ctx)
         
     except Exception as e:
         await ctx.send(f"⚠️ Erro: {str(e)}")
+
+# [Outros comandos permanecem iguais... skip, stop, pause, resume, queue, volume, loop, shuffle, now]
 
 @bot.hybrid_command(name="skip", description="Pula a música atual")
 async def skip(ctx):
