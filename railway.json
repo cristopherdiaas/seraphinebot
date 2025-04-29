@@ -3,7 +3,7 @@
     "builder": "NIXPACKS",
     "config": {
       "nixpacks": {
-        "packages": ["ffmpeg", "python3"]
+        "packages": ["ffmpeg", "python3", "libsodium-dev"]
       }
     }
   }
