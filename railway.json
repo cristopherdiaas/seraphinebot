@@ -1,10 +1,10 @@
 {
-    "build": {
-      "builder": "NIXPACKS",
-      "config": {
-        "nixpacks": {
-          "packages": ["ffmpeg", "python3"]
-        }
+  "build": {
+    "builder": "NIXPACKS",
+    "config": {
+      "nixpacks": {
+        "packages": ["ffmpeg", "python3"]
       }
     }
   }
+}
