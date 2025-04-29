@@ -1,5 +1,6 @@
 import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 import yt_dlp as youtube_dl
 import asyncio
@@ -7,10 +8,9 @@ from collections import deque
 import random
 from dotenv import load_dotenv
 
-# Configurações
+# Configurações iniciais
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-PREFIX = os.getenv('PREFIX', '!')
 
 # Verificação do PyNaCL
 try:
@@ -35,171 +35,152 @@ FFMPEG_OPTIONS = {
     'options': '-vn',
 }
 
-class MusicPlayer:
+class MusicBot(commands.Bot):
     def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        
+        super().__init__(
+            command_prefix='!',
+            intents=intents
+        )
+        
         self.queues = {}
         self.loops = {}
         self.volumes = {}
         self.default_volume = 0.5
 
-    # ... (outros métodos da classe MusicPlayer permanecem iguais)
+    async def setup_hook(self):
+        # Sincroniza os comandos slash
+        await self.tree.sync()
+        print("Comandos slash sincronizados!")
 
-# Inicialização do bot
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
+    async def get_info(self, query):
+        with youtube_dl.YoutubeDL(YTDL_OPTIONS) as ydl:
+            info = ydl.extract_info(f"ytsearch:{query}" if not query.startswith('http') else query, download=False)
+            return info['entries'][0] if 'entries' in info else info
 
-bot = commands.Bot(command_prefix=PREFIX, intents=intents)
-player = MusicPlayer()
+    async def create_source(self, info, volume=0.5):
+        return discord.FFmpegPCMAudio(info['url'], **FFMPEG_OPTIONS)
 
-async def sync_commands():
-    """Sincroniza os comandos slash globalmente"""
-    try:
-        await bot.tree.sync()
-        print("Comandos slash sincronizados com sucesso!")
-    except Exception as e:
-        print(f"Erro ao sincronizar comandos: {e}")
+    def get_queue(self, guild_id):
+        if guild_id not in self.queues:
+            self.queues[guild_id] = deque(maxlen=50)
+        return self.queues[guild_id]
 
-@bot.hybrid_command(name="setup", description="Sincroniza os comandos do bot")
-@commands.is_owner()
-async def setup(ctx):
-    """Comando para sincronizar os comandos slash"""
-    await ctx.defer()
-    await sync_commands()
-    await ctx.send("✅ Comandos sincronizados!")
-
-@bot.hybrid_command(name="join", description="Entra no seu canal de voz")
-async def join(ctx):
-    """Faz o bot entrar no canal de voz"""
-    try:
-        if not ctx.author.voice:
-            return await ctx.send("Você precisa estar em um canal de voz!")
+    async def play_next(self, interaction):
+        queue = self.get_queue(interaction.guild.id)
         
-        if ctx.voice_client:
-            if ctx.voice_client.channel == ctx.author.voice.channel:
-                return await ctx.send("Já estou no seu canal!")
-            await ctx.voice_client.move_to(ctx.author.voice.channel)
-        else:
-            await ctx.author.voice.channel.connect()
+        if self.loops.get(interaction.guild.id, False) and queue:
+            await self.play_song(interaction, queue[0])
+            return
+
+        if queue:
+            next_song = queue.popleft()
+            await self.play_song(interaction, next_song)
+
+    async def play_song(self, interaction, song):
+        try:
+            interaction.guild.voice_client.play(
+                song['audio'],
+                after=lambda e: asyncio.run_coroutine_threadsafe(
+                    self.play_next(interaction), 
+                    self.loop
+                )
+            )
+            await interaction.followup.send(f"🎵 Tocando agora: **{song['title']}**")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Erro ao reproduzir: {str(e)}")
+            await self.play_next(interaction)
+
+bot = MusicBot()
+
+@bot.tree.command(name="play", description="Toca uma música do YouTube")
+@app_commands.describe(query="URL ou nome da música")
+async def play(interaction: discord.Interaction, query: str):
+    """Toca música a partir de uma URL ou busca"""
+    await interaction.response.defer()
+    
+    if not interaction.user.voice:
+        return await interaction.followup.send("Você precisa estar em um canal de voz!")
+    
+    try:
+        # Conectar ao canal de voz se necessário
+        if not interaction.guild.voice_client:
+            await interaction.user.voice.channel.connect()
+        elif interaction.guild.voice_client.channel != interaction.user.voice.channel:
+            return await interaction.followup.send("Estou em outro canal de voz!")
+
+        info = await bot.get_info(query)
+        if not info:
+            return await interaction.followup.send("Não encontrei essa música.")
         
-        await ctx.send(f"✅ Conectado ao canal {ctx.author.voice.channel.name}")
+        volume = bot.volumes.get(interaction.guild.id, bot.default_volume)
+        source = await bot.create_source(info, volume)
+        
+        song_data = {
+            'audio': source,
+            'title': info['title'],
+            'url': info['webpage_url']
+        }
+        
+        queue = bot.get_queue(interaction.guild.id)
+        
+        if interaction.guild.voice_client.is_playing():
+            queue.append(song_data)
+            return await interaction.followup.send(f"🎶 Adicionado à fila (#{len(queue)}): **{info['title']}**")
+        
+        queue.append(song_data)
+        await bot.play_song(interaction, song_data)
+        
     except Exception as e:
-        await ctx.send(f"❌ Erro ao conectar: {str(e)}")
+        await interaction.followup.send(f"⚠️ Erro: {str(e)}")
 
-# [Outros comandos permanecem iguais... skip, stop, pause, resume, queue, volume, loop, shuffle, now]
-
-@bot.hybrid_command(name="skip", description="Pula a música atual")
-async def skip(ctx):
+@bot.tree.command(name="skip", description="Pula a música atual")
+async def skip(interaction: discord.Interaction):
     """Pula para a próxima música"""
-    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
-        ctx.voice_client.stop()
-        await ctx.send("⏭ Pulou para a próxima música")
+    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+        interaction.guild.voice_client.stop()
+        await interaction.response.send_message("⏭ Pulou a música")
     else:
-        await ctx.send("Nada está tocando!")
+        await interaction.response.send_message("Nada está tocando!")
 
-@bot.hybrid_command(name="stop", description="Para a música e limpa a fila")
-async def stop(ctx):
+@bot.tree.command(name="stop", description="Para a música e limpa a fila")
+async def stop(interaction: discord.Interaction):
     """Para o player e desconecta"""
-    if ctx.voice_client:
-        player.get_queue(ctx.guild.id).clear()
-        await ctx.voice_client.disconnect()
-        await ctx.send("🛑 Player parado e desconectado")
+    if interaction.guild.voice_client:
+        bot.get_queue(interaction.guild.id).clear()
+        await interaction.guild.voice_client.disconnect()
+        await interaction.response.send_message("🛑 Player parado e desconectado")
     else:
-        await ctx.send("Não estou conectado!")
+        await interaction.response.send_message("Não estou conectado!")
 
-@bot.hybrid_command(name="pause", description="Pausa a música atual")
-async def pause(ctx):
-    """Pausa a reprodução"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
-        await ctx.send("⏸ Música pausada")
-    else:
-        await ctx.send("Nada está tocando!")
-
-@bot.hybrid_command(name="resume", description="Continua a música pausada")
-async def resume(ctx):
-    """Continua a reprodução"""
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
-        await ctx.send("▶ Música continuada")
-    else:
-        await ctx.send("Nada está pausado!")
-
-@bot.hybrid_command(name="queue", description="Mostra a fila atual")
-async def show_queue(ctx):
-    """Mostra as próximas músicas"""
-    queue = player.get_queue(ctx.guild.id)
-    if not queue:
-        return await ctx.send("A fila está vazia!")
+@bot.tree.command(name="queue", description="Mostra a fila de músicas")
+async def queue(interaction: discord.Interaction):
+    """Mostra as próximas músicas na fila"""
+    queue = bot.get_queue(interaction.guild.id)
     
-    current = "Tocando agora: " + (
-        ctx.voice_client.source.title if hasattr(ctx.voice_client.source, 'title') 
-        else "Música atual"
-    )
+    if not queue and not (interaction.guild.voice_client and interaction.guild.voice_client.is_playing()):
+        return await interaction.response.send_message("A fila está vazia!")
     
-    upcoming = "\n".join(
-        f"{i+1}. {song['title']}" 
-        for i, song in enumerate(list(queue)[:10])
-    )
+    message = []
     
-    await ctx.send(f"**🎶 Fila de reprodução**\n{current}\n\n**Próximas:**\n{upcoming}")
-
-@bot.hybrid_command(name="volume", description="Ajusta o volume (0-100)")
-async def volume(ctx, level: int):
-    """Ajusta o volume (0-100)"""
-    if not 0 <= level <= 100:
-        return await ctx.send("Volume deve estar entre 0 e 100")
+    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+        message.append("**Tocando agora:** Música atual")
     
-    player.volumes[ctx.guild.id] = level / 100
-    await ctx.send(f"🔊 Volume ajustado para {level}%")
-
-@bot.hybrid_command(name="loop", description="Ativa/desativa o modo loop")
-async def loop(ctx):
-    """Repete a música atual continuamente"""
-    player.loops[ctx.guild.id] = not player.loops.get(ctx.guild.id, False)
-    status = "✅ ATIVADO" if player.loops[ctx.guild.id] else "❌ DESATIVADO"
-    await ctx.send(f"🔁 Modo loop: {status}")
-
-@bot.hybrid_command(name="shuffle", description="Embaralha a fila")
-async def shuffle(ctx):
-    """Embaralha a ordem da fila"""
-    queue = player.get_queue(ctx.guild.id)
-    if len(queue) > 1:
-        # Mantém a música atual se estiver tocando
-        if ctx.voice_client and ctx.voice_client.is_playing():
-            current = queue.popleft()
-            shuffled = list(queue)
-            random.shuffle(shuffled)
-            queue.clear()
-            queue.append(current)
-            queue.extend(shuffled)
-        else:
-            shuffled = list(queue)
-            random.shuffle(shuffled)
-            queue.clear()
-            queue.extend(shuffled)
-        await ctx.send("🔀 Fila embaralhada!")
-    else:
-        await ctx.send("Precisa de pelo menos 2 músicas na fila!")
-
-@bot.hybrid_command(name="now", description="Mostra a música atual")
-async def now_playing(ctx):
-    """Mostra informações da música atual"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        if hasattr(ctx.voice_client.source, 'title'):
-            await ctx.send(f"🎵 Tocando agora: **{ctx.voice_client.source.title}**")
-        else:
-            await ctx.send("🎵 Tocando música (informações não disponíveis)")
-    else:
-        await ctx.send("Nada está tocando no momento!")
+    if queue:
+        message.append("**Próximas músicas:**")
+        message.extend(f"{i+1}. {song['title']}" for i, song in enumerate(queue[:5]))
+    
+    await interaction.response.send_message("\n".join(message))
 
 @bot.event
 async def on_ready():
     print(f'Bot conectado como {bot.user}')
-    await bot.tree.sync()
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
-        name=f"{PREFIX}help | música 🎵"
+        name="música 🎵"
     ))
 
 if __name__ == "__main__":
